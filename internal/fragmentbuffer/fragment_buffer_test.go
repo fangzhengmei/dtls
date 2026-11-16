@@ -396,6 +396,216 @@ func TestFragmentBuffer_RetransmitDetection(t *testing.T) {
 	}
 }
 
+// A single datagram mixing a valid fragment, an overlapping conflicting
+// fragment and an over-budget fragment must fail validation and commit
+// nothing, not even the valid prefix of the batch.
+func TestFragmentBuffer_MixedInvalidBatchDoesNotCommit(t *testing.T) {
+	fragmentBuffer := New()
+	header := func(sequence uint16, offset, fragmentLength uint32) handshake.Header {
+		return handshake.Header{
+			Type:            handshake.TypeCertificate,
+			Length:          6,
+			MessageSequence: sequence,
+			FragmentOffset:  offset,
+			FragmentLength:  fragmentLength,
+		}
+	}
+
+	valid := marshalFragment(t, header(0, 0, 2), []byte{0x01, 0x02})
+	overlapping := marshalFragment(t, header(0, 1, 2), []byte{0x03, 0x04})
+	oversized := marshalFragment(t, handshake.Header{
+		Type:            handshake.TypeCertificate,
+		Length:          fragmentBufferMaxSize,
+		MessageSequence: 1,
+		FragmentLength:  fragmentBufferMaxSize,
+	}, make([]byte, fragmentBufferMaxSize))
+
+	batch := append(append(append([]byte{}, valid...), overlapping...), oversized...)
+	_, err := fragmentBuffer.Push(0, batch)
+	require.ErrorIs(t, err, dtlserrors.ErrInvalidPacket)
+
+	assert.Empty(t, fragmentBuffer.cache)
+	assert.Zero(t, fragmentBuffer.totalBufferSize)
+	assert.Zero(t, fragmentBuffer.totalFragmentCount)
+	content, _ := fragmentBuffer.Pop()
+	assert.Nil(t, content)
+}
+
+// A batch of otherwise valid fragments that exceeds the size budget must be
+// rejected as a whole: the valid fragments at the head of the batch must not
+// be committed either.
+func TestFragmentBuffer_MixedOverflowBatchDoesNotCommit(t *testing.T) {
+	fragmentBuffer := New()
+	small := handshake.Header{
+		Type:           handshake.TypeCertificate,
+		Length:         2,
+		FragmentLength: 2,
+	}
+	large := handshake.Header{
+		Type:            handshake.TypeCertificate,
+		Length:          fragmentBufferMaxSize,
+		MessageSequence: 1,
+		FragmentLength:  fragmentBufferMaxSize,
+	}
+	batch := append(marshalFragment(t, small, []byte{0x01, 0x02}),
+		marshalFragment(t, large, make([]byte, fragmentBufferMaxSize))...)
+
+	_, err := fragmentBuffer.Push(0, batch)
+	require.ErrorIs(t, err, dtlserrors.ErrFragmentBufferOverflow)
+
+	assert.Empty(t, fragmentBuffer.cache)
+	assert.Zero(t, fragmentBuffer.totalBufferSize)
+	assert.Zero(t, fragmentBuffer.totalFragmentCount)
+	content, _ := fragmentBuffer.Pop()
+	assert.Nil(t, content)
+}
+
+// Fragments cached under different message sequences must not be spliced
+// together into a reassembled message.
+func TestFragmentBuffer_NoSpliceAcrossMessageSequence(t *testing.T) {
+	fragmentBuffer := New()
+	header := func(sequence uint16, offset uint32) handshake.Header {
+		return handshake.Header{
+			Type:            handshake.TypeCertificate,
+			Length:          4,
+			MessageSequence: sequence,
+			FragmentOffset:  offset,
+			FragmentLength:  2,
+		}
+	}
+	reassembled := func(sequence uint16, payload []byte) []byte {
+		return marshalFragment(t, handshake.Header{
+			Type:            handshake.TypeCertificate,
+			Length:          4,
+			MessageSequence: sequence,
+			FragmentLength:  4,
+		}, payload)
+	}
+
+	// First half of sequence 0 and second half of sequence 1: neither
+	// message is complete and they must not complete each other.
+	_, err := fragmentBuffer.Push(0, marshalFragment(t, header(0, 0), []byte{0xa0, 0xa1}))
+	require.NoError(t, err)
+	_, err = fragmentBuffer.Push(0, marshalFragment(t, header(1, 2), []byte{0xb2, 0xb3}))
+	require.NoError(t, err)
+	assert.Equal(t, 2, fragmentBuffer.totalFragmentCount)
+	assert.Equal(t, 4, fragmentBuffer.totalBufferSize)
+	content, _ := fragmentBuffer.Pop()
+	assert.Nil(t, content)
+
+	// Completing sequence 0 must not consume sequence 1's cached fragment.
+	_, err = fragmentBuffer.Push(0, marshalFragment(t, header(0, 2), []byte{0xa2, 0xa3}))
+	require.NoError(t, err)
+	content, epoch := fragmentBuffer.Pop()
+	assert.Equal(t, reassembled(0, []byte{0xa0, 0xa1, 0xa2, 0xa3}), content)
+	assert.Equal(t, uint64(0), epoch)
+
+	content, _ = fragmentBuffer.Pop()
+	assert.Nil(t, content)
+
+	// Sequence 1 is still cached and completes with its own first half.
+	_, err = fragmentBuffer.Push(0, marshalFragment(t, header(1, 0), []byte{0xb0, 0xb1}))
+	require.NoError(t, err)
+	content, epoch = fragmentBuffer.Pop()
+	assert.Equal(t, reassembled(1, []byte{0xb0, 0xb1, 0xb2, 0xb3}), content)
+	assert.Equal(t, uint64(0), epoch)
+	assert.Zero(t, fragmentBuffer.totalBufferSize)
+	assert.Zero(t, fragmentBuffer.totalFragmentCount)
+}
+
+// Fragments received under different record epochs must not be spliced
+// together: a cached message only completes with fragments from its own
+// epoch, and each reassembled message reports its own epoch.
+func TestFragmentBuffer_NoSpliceAcrossEpochs(t *testing.T) {
+	fragmentBuffer := New()
+	header := func(sequence uint16, offset uint32) handshake.Header {
+		return handshake.Header{
+			Type:            handshake.TypeCertificate,
+			Length:          4,
+			MessageSequence: sequence,
+			FragmentOffset:  offset,
+			FragmentLength:  2,
+		}
+	}
+	reassembled := func(sequence uint16, payload []byte) []byte {
+		return marshalFragment(t, handshake.Header{
+			Type:            handshake.TypeCertificate,
+			Length:          4,
+			MessageSequence: sequence,
+			FragmentLength:  4,
+		}, payload)
+	}
+
+	_, err := fragmentBuffer.Push(1, marshalFragment(t, header(0, 0), []byte{0xa0, 0xa1}))
+	require.NoError(t, err)
+	_, err = fragmentBuffer.Push(2, marshalFragment(t, header(1, 0), []byte{0xb0, 0xb1}))
+	require.NoError(t, err)
+
+	// A fragment from epoch 2 must not complete the message cached at epoch 1.
+	_, err = fragmentBuffer.Push(2, marshalFragment(t, header(0, 2), []byte{0xa2, 0xa3}))
+	require.ErrorIs(t, err, dtlserrors.ErrInvalidPacket)
+	assert.Equal(t, 2, fragmentBuffer.totalFragmentCount)
+	assert.Equal(t, 4, fragmentBuffer.totalBufferSize)
+
+	// Completing each message with a fragment from its own epoch works and
+	// the recovered messages carry their respective epochs.
+	_, err = fragmentBuffer.Push(1, marshalFragment(t, header(0, 2), []byte{0xa2, 0xa3}))
+	require.NoError(t, err)
+	content, epoch := fragmentBuffer.Pop()
+	assert.Equal(t, reassembled(0, []byte{0xa0, 0xa1, 0xa2, 0xa3}), content)
+	assert.Equal(t, uint64(1), epoch)
+
+	_, err = fragmentBuffer.Push(2, marshalFragment(t, header(1, 2), []byte{0xb2, 0xb3}))
+	require.NoError(t, err)
+	content, epoch = fragmentBuffer.Pop()
+	assert.Equal(t, reassembled(1, []byte{0xb0, 0xb1, 0xb2, 0xb3}), content)
+	assert.Equal(t, uint64(2), epoch)
+	assert.Zero(t, fragmentBuffer.totalBufferSize)
+	assert.Zero(t, fragmentBuffer.totalFragmentCount)
+}
+
+// Identical fragments repeated within a single datagram are committed once:
+// duplicates must not be billed against the fragment count or size budget.
+func TestFragmentBuffer_DuplicatesWithinBatchCountedOnce(t *testing.T) {
+	fragmentBuffer := New()
+	header := func(offset uint32) handshake.Header {
+		return handshake.Header{
+			Type:           handshake.TypeCertificate,
+			Length:         4,
+			FragmentOffset: offset,
+			FragmentLength: 2,
+		}
+	}
+	first := marshalFragment(t, header(0), []byte{0x01, 0x02})
+	second := marshalFragment(t, header(2), []byte{0x03, 0x04})
+
+	batch := append(append(append([]byte{}, first...), first...), second...)
+	batch = append(batch, first...)
+	_, err := fragmentBuffer.Push(0, batch)
+	require.NoError(t, err)
+	assert.Equal(t, 2, fragmentBuffer.totalFragmentCount)
+	assert.Equal(t, 4, fragmentBuffer.totalBufferSize)
+
+	content, epoch := fragmentBuffer.Pop()
+	assert.Equal(t, marshalFragment(t, handshake.Header{
+		Type:           handshake.TypeCertificate,
+		Length:         4,
+		FragmentLength: 4,
+	}, []byte{0x01, 0x02, 0x03, 0x04}), content)
+	assert.Equal(t, uint64(0), epoch)
+	assert.Zero(t, fragmentBuffer.totalBufferSize)
+	assert.Zero(t, fragmentBuffer.totalFragmentCount)
+}
+
+func marshalFragment(t *testing.T, header handshake.Header, payload []byte) []byte {
+	t.Helper()
+	require.Len(t, payload, int(header.FragmentLength))
+	rawHeader, err := header.Marshal()
+	require.NoError(t, err)
+
+	return append(rawHeader, payload...)
+}
+
 func marshalHandshakeContent(t *testing.T, headers ...handshake.Header) []byte {
 	t.Helper()
 
